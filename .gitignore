@@ -1,0 +1,12 @@
+# 构建产物（可再生，不入库）
+release/
+tools/make_pack.exe
+
+# .NET 构建缓存
+**/bin/
+**/obj/
+
+# IDE
+.vs/
+.idea/
+*.user
