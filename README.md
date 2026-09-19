@@ -1,4 +1,4 @@
-# Sephiria 贴图替换 Mod (v1.0)
+# Sephiria 贴图替换 Mod
 
 基于 BepInEx 5 的 Sephiria 贴图替换框架。替换游戏内任意贴图，无需修改游戏文件。
 
