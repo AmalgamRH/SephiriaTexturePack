@@ -11,9 +11,11 @@ using UnityEngine.UI;
 
 namespace SephiriaTextureReplacer
 {
-    [BepInPlugin("com.sisyphus.sephiriatexturereplacer", "Sephiria Texture Replacer", "1.0.0")]
+    [BepInPlugin("com.sisyphus.sephiriatexturereplacer", "Sephiria Texture Replacer", Version)]
     public class SephiriaTextureReplacerPlugin : BaseUnityPlugin
     {
+        private const string Version = "1.0.1";
+
         internal static ManualLogSource Log;
         private static string PluginDir;
         private static string TextureDir;
@@ -23,12 +25,14 @@ namespace SephiriaTextureReplacer
         private static readonly Dictionary<string, Texture2D> TextureCache = new Dictionary<string, Texture2D>();
         private static readonly HashSet<string> Missing = new HashSet<string>();
         private static readonly HashSet<UnityEngine.Object> ReplacedInstances = new HashSet<UnityEngine.Object>();
+        private static Func<Texture2D, byte[], bool> _loadImage;
         private static Harmony _harmony;
         private float _scanTimer;
 
         private void Awake()
         {
             Log = Logger;
+            _loadImage = BindLoadImage();
             PluginDir = Path.GetDirectoryName(typeof(SephiriaTextureReplacerPlugin).Assembly.Location);
             TextureDir = Path.Combine(PluginDir, "textures");
             if (!Directory.Exists(TextureDir))
@@ -38,8 +42,18 @@ namespace SephiriaTextureReplacer
             _harmony = new Harmony("com.sisyphus.sephiriatexturereplacer");
             try
             {
+                _harmony.Patch(AccessTools.Method(typeof(SpriteRenderer), "set_sprite"),
+                    prefix: new HarmonyMethod(typeof(SephiriaTextureReplacerPlugin).GetMethod(nameof(SpriteSetPrefix), BindingFlags.NonPublic | BindingFlags.Static)));
+                Log.LogInfo("[STR] SpriteRenderer.set_sprite patched OK");
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[STR] SpriteRenderer.set_sprite patch FAILED: " + e.Message);
+            }
+            try
+            {
                 _harmony.Patch(AccessTools.Method(typeof(Image), "set_sprite"),
-                    prefix: new HarmonyMethod(typeof(SephiriaTextureReplacerPlugin).GetMethod(nameof(ImageSetSpritePrefix), BindingFlags.NonPublic | BindingFlags.Static)));
+                    prefix: new HarmonyMethod(typeof(SephiriaTextureReplacerPlugin).GetMethod(nameof(SpriteSetPrefix), BindingFlags.NonPublic | BindingFlags.Static)));
                 Log.LogInfo("[STR] Image.set_sprite patched OK");
             }
             catch (Exception e)
@@ -59,7 +73,7 @@ namespace SephiriaTextureReplacer
 
             ScanAll();
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += (scene, mode) => ScanAll();
-            Log.LogInfo("[STR] v0.3.0 engine ready (" + (UseManifest ? "manifest mode" : "name-convention mode") + ")");
+            Log.LogInfo("[STR] v" + Version + " engine ready (" + (UseManifest ? "manifest mode" : "name-convention mode") + ")");
         }
 
         private void Update()
@@ -126,6 +140,11 @@ namespace SephiriaTextureReplacer
         {
             try
             {
+                // 清理已销毁对象的引用：避免 HashSet 无限增长（内存泄漏），
+                // 同时防止 Unity instanceID 被回收复用后把新对象误判为“已替换”而跳过。
+                // （UnityEngine.Object 重载了 ==，已销毁对象与 null 比较为 true）
+                ReplacedInstances.RemoveWhere(o => o == null);
+
                 foreach (var sr in UnityEngine.Object.FindObjectsByType<SpriteRenderer>(FindObjectsSortMode.None))
                 {
                     if (ReplacedInstances.Contains(sr)) continue;
@@ -165,7 +184,13 @@ namespace SephiriaTextureReplacer
 
         // ---------- patch 通道 A ----------
 
-        private static void ImageSetSpritePrefix(ref Sprite value)
+        /// <summary>
+        /// SpriteRenderer 与 Image 共用的 sprite setter 前缀。
+        /// 游戏内的 2D 动画（Animator2D_SpriteRenderer / SimpleAnimator2D）是脚本驱动，
+        /// 每帧执行 spriteRenderer.sprite = 当前帧，因此必须在 setter 上拦截；
+        /// 仅靠 ScanAll 轮询 + 实例标记只能命中某一帧，无法替换动图。
+        /// </summary>
+        private static void SpriteSetPrefix(ref Sprite value)
         {
             if (value == null) return;
             var repl = GetReplacement(value);
@@ -188,7 +213,8 @@ namespace SephiriaTextureReplacer
             {
                 if (s == null) return null;
                 var tex = s.texture;
-                string key = tex != null ? tex.name : s.name;
+                // tex.name 可能为空（图集/运行时合成纹理），此时回退到 Sprite 名称
+                string key = (tex != null && !string.IsNullOrEmpty(tex.name)) ? tex.name : s.name;
                 if (string.IsNullOrEmpty(key)) return null;
                 if (Missing.Contains(key)) return null;
                 if (SpriteCache.TryGetValue(key, out var cached)) return cached;
@@ -281,213 +307,98 @@ namespace SephiriaTextureReplacer
             }
         }
 
-        // ---------- PNG 解码（自研 + GDI+ 兜底） ----------
+        // ---------- PNG 解码（Unity 内置 ImageConversionModule） ----------
 
-        private static Texture2D LoadTexture(string path, string name, bool mipChain, FilterMode filter, TextureWrapMode wrap)
+        /// <summary>
+        /// 绑定 ImageConversion.LoadImage(Texture2D, byte[]) 为委托。
+        /// 原因：Unity 6 的 ImageConversion 另有 ReadOnlySpan&lt;byte&gt; 重载，而本项目目标 net472、
+        /// 游戏程序集为 netstandard 2.1（Span 经 mscorlib 转发），编译期无法解析该类型（CS0518）。
+        /// 用反射直接绑定无 Span 的 byte[] 重载，既保留引擎解码器，又无需新增依赖或改动目标框架。
+        /// </summary>
+        private static Func<Texture2D, byte[], bool> BindLoadImage()
         {
-            var bytes = File.ReadAllBytes(path);
-            Color32[] pixels;
-            int w, h;
             try
             {
-                pixels = DecodePng(bytes, out w, out h);
+                var mi = typeof(ImageConversion).GetMethod(
+                    "LoadImage",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null,
+                    new[] { typeof(Texture2D), typeof(byte[]) },
+                    null);
+                if (mi == null)
+                {
+                    Log.LogWarning("[STR] ImageConversion.LoadImage(Texture2D, byte[]) not found");
+                    return null;
+                }
+                var fn = (Func<Texture2D, byte[], bool>)Delegate.CreateDelegate(typeof(Func<Texture2D, byte[], bool>), mi);
+                Log.LogInfo("[STR] PNG decoder: engine ImageConversion.LoadImage bound");
+                return fn;
             }
             catch (Exception e)
             {
-                Log.LogWarning("[STR] internal PNG decode failed (" + e.Message + "), fallback to GDI+");
-                pixels = DecodePngGdiPlus(path, out w, out h);
+                Log.LogWarning("[STR] ImageConversion.LoadImage bind FAILED: " + e.Message);
+                return null;
             }
-            var tex = new Texture2D(w, h, TextureFormat.RGBA32, mipChain);
+        }
+
+        private static Texture2D LoadTexture(string path, string name, bool mipChain, FilterMode filter, TextureWrapMode wrap)
+        {
+            Texture2D tex = null;
+            try
+            {
+                var bytes = File.ReadAllBytes(path);
+
+                // 引擎解码器只认 PNG / JPEG，且靠内容而非扩展名判断。
+                // 提前报出可读错误（常见坑：把 GIF / JPG 直接改名成 .png）。
+                if (!IsPngOrJpeg(bytes))
+                {
+                    Log.LogWarning("[STR] '" + name + "' 不是 PNG/JPEG（文件头 " + HexHead(bytes) + "），已跳过；请另存为 PNG 后重试");
+                    return null;
+                }
+
+                // 使用 Unity 引擎内置解码器（UnityEngine.ImageConversionModule）。
+                // 覆盖此前自研解码器不支持的场景：16 位色深、Adam7 隔行扫描、
+                // 调色板 tRNS 透明色、灰度 tRNS 等；无需额外引入第三方 PNG 库。
+                tex = new Texture2D(2, 2, TextureFormat.RGBA32, mipChain);
+                if (_loadImage == null || !_loadImage(tex, bytes))
+                {
+                    Log.LogWarning("[STR] PNG decode failed for '" + name + "'");
+                    UnityEngine.Object.Destroy(tex);
+                    return null;
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("[STR] PNG decode failed for '" + name + "': " + e.Message);
+                if (tex != null) UnityEngine.Object.Destroy(tex);
+                return null;
+            }
+
             tex.name = name;
             // 复制原纹理采样参数（像素游戏多为 Point 最近邻，否则放大模糊）
             tex.filterMode = filter;
             tex.wrapMode = wrap;
-            tex.SetPixels32(pixels);
-            tex.Apply(mipChain, false);
             return tex;
         }
 
-        private static Color32[] DecodePng(byte[] data, out int w, out int h)
+        // PNG 签名 89 50 4E 47；JPEG 起始 FF D8 FF
+        private static bool IsPngOrJpeg(byte[] b)
         {
-            if (data.Length < 8 || data[0] != 0x89 || data[1] != 0x50)
-                throw new Exception("not a png");
-            w = 0; h = 0;
-            int pos = 8;
-            int bitDepth = 8, colorType = 0;
-            byte[] idat = null;
-            var palette = new Color32[256];
-            var trns = new byte[256];
-            bool hasTrns = false;
-            while (pos + 8 <= data.Length)
-            {
-                int len = ReadBE32(data, pos); pos += 4;
-                if (len < 0 || pos + 4 + len + 4 > data.Length) break;
-                string type = System.Text.Encoding.ASCII.GetString(data, pos, 4); pos += 4;
-                int chunkStart = pos;
-                pos += len + 4; // data + crc
-                if (type == "IHDR" && len >= 13)
-                {
-                    w = ReadBE32(data, chunkStart); h = ReadBE32(data, chunkStart + 4);
-                    bitDepth = data[chunkStart + 8]; colorType = data[chunkStart + 9];
-                }
-                else if (type == "IDAT")
-                {
-                    if (idat == null)
-                    {
-                        idat = new byte[len];
-                        Array.Copy(data, chunkStart, idat, 0, len);
-                    }
-                    else
-                    {
-                        var n = new byte[idat.Length + len];
-                        Array.Copy(idat, 0, n, 0, idat.Length);
-                        Array.Copy(data, chunkStart, n, idat.Length, len);
-                        idat = n;
-                    }
-                }
-                else if (type == "PLTE")
-                {
-                    for (int i = 0; i + 2 < len; i += 3)
-                        palette[i / 3] = new Color32(data[chunkStart + i], data[chunkStart + i + 1], data[chunkStart + i + 2], 255);
-                }
-                else if (type == "tRNS")
-                {
-                    hasTrns = true;
-                    Array.Copy(data, chunkStart, trns, 0, Math.Min(len, trns.Length));
-                }
-            }
-            if (bitDepth != 8)
-                throw new Exception("unsupported bit depth " + bitDepth);
-            if (colorType != 0 && colorType != 2 && colorType != 3 && colorType != 4 && colorType != 6)
-                throw new Exception("unsupported color type " + colorType);
-            int bpp = colorType == 0 ? 1 : colorType == 2 ? 3 : colorType == 3 ? 1 : colorType == 4 ? 2 : 4;
-            int stride = w * bpp; // bitDepth=8 时每像素字节数 = bpp
-            var raw = Inflate(idat, (stride + 1) * h);
-            var rows = new byte[h][];
-            for (int y = 0; y < h; y++)
-            {
-                int off = y * (stride + 1);
-                byte filter = raw[off];
-                var row = new byte[stride];
-                Array.Copy(raw, off + 1, row, 0, stride);
-                Unfilter(row, filter, y > 0 ? rows[y - 1] : null, bpp);
-                rows[y] = row;
-            }
-            var pixels = new Color32[w * h];
-            for (int y = 0; y < h; y++)
-            {
-                int destY = h - 1 - y; // Unity y=0 在底部
-                var row = rows[y];
-                for (int x = 0; x < w; x++)
-                {
-                    byte r, g, b, a;
-                    switch (colorType)
-                    {
-                        case 0:
-                            r = g = b = row[x];
-                            a = (hasTrns && row[x] == trns[0]) ? (byte)0 : (byte)255;
-                            break;
-                        case 2:
-                            r = row[x * 3]; g = row[x * 3 + 1]; b = row[x * 3 + 2]; a = 255;
-                            break;
-                        case 3:
-                        {
-                            var p = palette[row[x]];
-                            r = p.r; g = p.g; b = p.b;
-                            a = (hasTrns && row[x] < trns.Length) ? trns[row[x]] : p.a;
-                            break;
-                        }
-                        case 4:
-                            r = g = b = row[x * 2]; a = row[x * 2 + 1];
-                            break;
-                        default:
-                            r = row[x * 4]; g = row[x * 4 + 1]; b = row[x * 4 + 2]; a = row[x * 4 + 3];
-                            break;
-                    }
-                    pixels[destY * w + x] = new Color32(r, g, b, a);
-                }
-            }
-            return pixels;
+            if (b.Length >= 4 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true;
+            if (b.Length >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true;
+            return false;
         }
 
-        private static byte[] Inflate(byte[] zlib, int expected)
+        private static string HexHead(byte[] b)
         {
-            var buf = new byte[expected];
-            using (var ms = new MemoryStream(zlib, 2, zlib.Length - 2))
-            using (var ds = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+            int n = Math.Min(4, b.Length);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < n; i++)
             {
-                int read = 0;
-                while (read < expected)
-                {
-                    int n = ds.Read(buf, read, expected - read);
-                    if (n <= 0) break;
-                    read += n;
-                }
-                Array.Resize(ref buf, read);
+                if (i > 0) sb.Append(' ');
+                sb.Append(b[i].ToString("X2"));
             }
-            if (buf.Length < expected)
-                throw new Exception("inflate short (" + buf.Length + "/" + expected + ")");
-            return buf;
-        }
-
-        private static void Unfilter(byte[] row, byte filter, byte[] prev, int bpp)
-        {
-            switch (filter)
-            {
-                case 0: break;
-                case 1:
-                    for (int i = bpp; i < row.Length; i++) row[i] = (byte)(row[i] + row[i - bpp]);
-                    break;
-                case 2:
-                    if (prev != null)
-                        for (int i = 0; i < row.Length; i++) row[i] = (byte)(row[i] + prev[i]);
-                    break;
-                case 3:
-                    for (int i = 0; i < row.Length; i++)
-                    {
-                        int a = i >= bpp ? row[i - bpp] : 0;
-                        int b = prev != null ? prev[i] : 0;
-                        row[i] = (byte)(row[i] + ((a + b) / 2));
-                    }
-                    break;
-                case 4:
-                    for (int i = 0; i < row.Length; i++)
-                    {
-                        int a = i >= bpp ? row[i - bpp] : 0;
-                        int b = prev != null ? prev[i] : 0;
-                        int c = (i >= bpp && prev != null) ? prev[i - bpp] : 0;
-                        int p = a + b - c;
-                        int pa = Math.Abs(p - a), pb = Math.Abs(p - b), pc = Math.Abs(p - c);
-                        int pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
-                        row[i] = (byte)(row[i] + pr);
-                    }
-                    break;
-                default:
-                    throw new Exception("bad filter " + filter);
-            }
-        }
-
-        private static int ReadBE32(byte[] d, int o)
-        {
-            return (d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3];
-        }
-
-        private static Color32[] DecodePngGdiPlus(string path, out int w, out int h)
-        {
-            using (var bmp = new System.Drawing.Bitmap(path))
-            {
-                w = bmp.Width; h = bmp.Height;
-                var px = new Color32[w * h];
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        var c = bmp.GetPixel(x, h - 1 - y);
-                        px[y * w + x] = new Color32(c.R, c.G, c.B, c.A);
-                    }
-                }
-                return px;
-            }
+            return sb.ToString();
         }
     }
 }

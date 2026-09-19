@@ -10,3 +10,6 @@ tools/make_pack.exe
 .vs/
 .idea/
 *.user
+
+# 工作流临时状态（本地，不入库）
+.omo/
